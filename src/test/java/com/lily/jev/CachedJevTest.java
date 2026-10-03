@@ -19,6 +19,47 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CachedJevTest {
+    @Test
+    void concurrentRequestsShareOnePendingCallAndOtherKeysStayIndependent() throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);
+        var release=new java.util.concurrent.CountDownLatch(1);
+        var calls=new AtomicInteger();
+        Jev delegate=(state,question) -> {
+            calls.incrementAndGet();
+            if (state.get("key").equals("same")) {
+                entered.countDown();
+                try { if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IllegalStateException("timeout"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return Optional.empty(); }
+            }
+            return Optional.of(new Answer("aws",null,.9));
+        };
+        var cached=new CachedJev(delegate,Duration.ofMinutes(1),16);
+        var pool=java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            var first=pool.submit(() -> cached.ask(Map.of("key","same"),cloud));
+            assertTrue(entered.await(2,java.util.concurrent.TimeUnit.SECONDS));
+            var second=pool.submit(() -> cached.ask(Map.of("key","same"),cloud));
+            var other=pool.submit(() -> cached.ask(Map.of("key","other"),cloud));
+            assertTrue(other.get(2,java.util.concurrent.TimeUnit.SECONDS).isPresent());
+            Thread.sleep(50);
+            assertEquals(2,calls.get());
+            release.countDown();
+            assertEquals(first.get(2,java.util.concurrent.TimeUnit.SECONDS),second.get(2,java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(2,calls.get());
+        } finally { release.countDown(); pool.shutdownNow(); }
+    }
+
+    @Test
+    void failedOwnerClearsPendingEntryForTheNextCall() {
+        var calls=new AtomicInteger();
+        var cached=new CachedJev((s,q) -> {
+            if (calls.incrementAndGet()==1) throw new IllegalStateException("upstream failure");
+            return Optional.of(new Answer("gcp",null,.9));
+        },Duration.ofMinutes(1),4);
+        assertThrows(IllegalStateException.class,() -> cached.ask(Map.of(),cloud));
+        assertEquals("gcp",cached.ask(Map.of(),cloud).orElseThrow().choice());
+        assertEquals(2,calls.get());
+    }
 
     private final Question.Choice cloud = new Question.Choice("cloud", "어디에 배포할까",
             Map.of("aws", "AWS", "gcp", "GCP", "hold", "보류"));

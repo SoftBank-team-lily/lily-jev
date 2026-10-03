@@ -14,6 +14,9 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.HashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
 /**
  * 같은 질문·같은 상태의 답을 정해 둔 시간 동안 다시 쓴다.
@@ -37,6 +40,7 @@ public final class CachedJev implements Jev {
     private final int maxEntries;
     private final Clock clock;
     private final Map<String, Entry> entries;
+    private final Map<String, CompletableFuture<Optional<Answer>>> pending = new HashMap<>();
 
     public CachedJev(Jev delegate, Duration ttl, int maxEntries) {
         this(delegate, ttl, maxEntries, Clock.systemUTC());
@@ -65,20 +69,38 @@ public final class CachedJev implements Jev {
         if (key == null) {
             return delegate.ask(state, question);
         }
-        Optional<Answer> stored = fresh(key);
-        if (stored != null) {
-            return stored;
-        }
-        Optional<Answer> answer = delegate.ask(state, question);
+        CompletableFuture<Optional<Answer>> flight;
+        boolean owner;
         synchronized (entries) {
-            // 같은 질문을 동시에 물었으면 먼저 저장된 답으로 맞춘다
-            Entry other = entries.get(key);
-            if (other != null && other.expiresAt().isAfter(clock.instant())) {
-                return other.answer();
+            Optional<Answer> stored = fresh(key);
+            if (stored != null) return stored;
+            flight = pending.get(key);
+            owner = flight == null;
+            if (owner) {
+                // 진행 중 요청도 제한한다. 포화되면 호출자가 기존 규칙으로 처리한다.
+                if (pending.size() >= maxEntries) return Optional.empty();
+                flight = new CompletableFuture<>();
+                pending.put(key, flight);
             }
-            entries.put(key, new Entry(answer, clock.instant().plus(ttl)));
         }
-        return answer;
+        if (!owner) {
+            try { return flight.get(); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return Optional.empty(); }
+            catch (ExecutionException e) { return Optional.empty(); }
+        }
+        try {
+            Optional<Answer> answer = java.util.Objects.requireNonNull(delegate.ask(state, question));
+            synchronized (entries) {
+                entries.put(key, new Entry(answer, clock.instant().plus(ttl)));
+            }
+            flight.complete(answer);
+            return answer;
+        } catch (RuntimeException | Error e) {
+            flight.completeExceptionally(e);
+            throw e;
+        } finally {
+            synchronized (entries) { pending.remove(key, flight); }
+        }
     }
 
     @Override
